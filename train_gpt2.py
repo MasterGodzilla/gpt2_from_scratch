@@ -220,19 +220,18 @@ def generate(model: GPT,
              tokenizer = None,
              max_new_tokens: int = 100, 
              temperature: float = 1.0, 
-             top_k: int = None,
-             device: str = 'cuda'):
+             top_k: int = None):
     
     if isinstance(x, str):
-        x = torch.tensor(tokenizer.encode(x)).unsqueeze(0)
+        x = torch.tensor(tokenizer.encode(x), device=next(model.parameters()).device).unsqueeze(0)
     
-    if isinstance(x, torch.Tensor): # so we catch error if str treatment fails
-        pass
+    if isinstance(x, torch.Tensor):
+        x = x.to(next(model.parameters()).device)
     else:
         raise ValueError(f"Invalid input type: {type(x)}")
     
     
-    x = x.to(device) # [batch_size, seq_len]
+    # x = x.to(model.device) # [batch_size, seq_len]
     seq_len = x.size(1)
     if seq_len > model.config.block_size:
         raise ValueError(f"Cannot generate more tokens than the model's block size: {model.config.block_size}")
@@ -241,6 +240,8 @@ def generate(model: GPT,
     for _ in range(max_new_tokens):
         logits, _ = model(x)
         logits = logits[:, -1, :]
+        # Mask out tokens beyond 50257 (the actual vocabulary size)
+        logits[:, 50257:] = float('-inf')
         if temperature > 0.01:
             probs = F.softmax(logits / temperature, dim=-1)
             if top_k is not None:
@@ -254,11 +255,11 @@ def generate(model: GPT,
 
 
 
-def test_model(model, tokenizer, device):
+def test_model(model, tokenizer):
     model.eval()
     print('Testing model inference...')
     message = "Hello, how are you?"
-    output = generate(model, message, tokenizer, max_new_tokens=100, temperature=0.5, device=device)
+    output = generate(model, message, tokenizer, max_new_tokens=100, temperature=0.5)
     print(">>>", tokenizer.decode(output[0].tolist()))
     model.train()
 
@@ -280,9 +281,11 @@ def parse_args():
     return parser.parse_args()
 
 class DataLoaderLite:
-    def __init__(self, B, T, enc):
+    def __init__(self, B, T, enc, local_rank = 0, world_size = 1):
         self.B = B
         self.T = T
+        self.local_rank = local_rank
+        self.world_size = world_size
 
         with open("input.txt", "r") as f:
             text = f.read()
@@ -290,7 +293,7 @@ class DataLoaderLite:
         self.tokens = enc.encode(text)
         print(f"Loaded {len(self.tokens)} tokens")
 
-        self.current_idx = 0
+        self.current_idx = local_rank * B * T # each process takes the ith chunk of a page of data
         self.epoch = 0
     
     def next_batch(self, i=None):
@@ -310,8 +313,8 @@ class DataLoaderLite:
         buf = torch.tensor(self.tokens[start_idx:end_idx])
         x = buf[:-1].view(self.B, self.T)  # Input sequence
         y = buf[1:].view(self.B, self.T)   # Target sequence
-        self.current_idx = end_idx - 1  # -1 to rewind the target shift
-        
+
+        self.current_idx = self.current_idx + self.B * self.T * self.world_size
         return x.to(args.device), y.to(args.device)
 
 def get_lr(i, lr = 1e-3, schedule_type='cosine'):
@@ -354,8 +357,47 @@ if __name__ == "__main__":
         print("Please specify either --train or --test")
         exit(1)
     
+    
+
     if args.train:
+
+        # ddp
+        from torch.distributed import init_process_group, destroy_process_group
+        import os
+
+        # terminal command: 
+        # CUDA_VISIBLE_DEVICES=0,5,8,9 CUDA_LAUNCH_BLOCKING=1 TORCH_USE_CUDA_DSA=1 torchrun --standalone --nproc_per_node=4 train_gpt2.py --train --model_type gpt2-mini --batch_size 16 --learning_rate_schedule trapezoid
+
+        ddp = int(os.environ.get('RANK', -1)) != -1 # check if ddp is enabled
+        if ddp:
+            print("DDP enabled")
+
+        if ddp:
+            assert torch.cuda.is_available(), "We need cuda available for ddp!"
+            assert 'cuda' in args.device, "Device types other than cuda is not supported by ddp"
+            init_process_group(backend='nccl')
+            ddp_rank = int(os.environ['RANK'])
+            ddp_world_size = int(os.environ['WORLD_SIZE'])
+            ddp_local_rank = int(os.environ['LOCAL_RANK'])
+            device = f'cuda:{ddp_local_rank}'
+            torch.cuda.set_device(ddp_local_rank)
+            print(f"Using device: {device}, rank: {ddp_rank}, world size: {ddp_world_size}, local rank: {ddp_local_rank}")
+            is_master_process = ddp_rank == 0 
+            
+        else: 
+            ddp_rank, ddp_local_rank, ddp_world_size, is_master_process = 0, 0, 1, True
+            device = args.device
+        
+        torch.manual_seed(1337)
+        if torch.cuda.is_available() and 'cuda' in args.device:
+            torch.cuda.manual_seed(1337)    
+
         B, T = args.batch_size, args.seq_len
+        assert args.total_batch_size % (B * T * ddp_world_size) == 0, "Total batch size must be divisible by the product of batch size, sequence length, and world size"
+        grad_accum_steps = args.total_batch_size // (B * T * ddp_world_size)
+        if is_master_process:
+            print(f"Using grad accum steps: {grad_accum_steps}")
+        
         torch.set_float32_matmul_precision('high')
 
         import tiktoken
@@ -365,29 +407,36 @@ if __name__ == "__main__":
         config_args = config_dict[args.model_type]
         config_args['vocab_size'] = 50304
         model = GPT(GPTConfig(**config_args))
-        model.to(args.device)
+        model.to(device)
         model.train()
         # model.compile()
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        if ddp:
+            model = DDP(model, device_ids=[ddp_local_rank]) # wrap the model with DDP
 
-        optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=args.learning_rate, betas=(0.9, 0.95), device_type=args.device)
+        raw_model = model.module if ddp else model
+        optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=args.learning_rate, betas=(0.9, 0.95), device_type=device)
 
-        assert args.total_batch_size % (B * T) == 0, "Total batch size must be divisible by the product of batch size and sequence length"
-        grad_accum_steps = args.total_batch_size // (B * T)
+        
         from time import time
         for i in range(args.max_steps):
-            if i % args.interval_size == 0:
-                test_model(model, enc, args.device)
+            if i % args.interval_size == 0 and is_master_process:
+                test_model(raw_model, enc)
 
             start_time = time()
             optimizer.zero_grad()
             loss_accum = 0.0
-            for _ in range(grad_accum_steps):
+            for micro_step in range(grad_accum_steps):
                 x, y = data_loader.next_batch()
-                with torch.autocast(device_type=args.device, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
                     logits, loss = model(x, y)
                 loss = loss / grad_accum_steps
                 loss_accum += loss.detach()
+                if ddp:
+                    model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) # sync gradients at the last micro step
                 loss.backward()
+            if ddp:
+                torch.distributed.all_reduce(loss_accum, op=torch.distributed.ReduceOp.AVG)
             norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             lr = get_lr(i, args.learning_rate, args.learning_rate_schedule)
             for param_group in optimizer.param_groups:
@@ -396,16 +445,19 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
             end_time = time()
             throughput = (args.total_batch_size) / (end_time - start_time)
-            print(f'iter {i}, loss: {loss_accum:.4f}, time: {end_time - start_time:.4f}s, norm: {norm:.4f}, lr: {lr:.2e}, throughput: {throughput:.1f} tokens/s')
+            if is_master_process:
+                print(f'iter {i}, loss: {loss_accum:.4f}, time: {end_time - start_time:.4f}s, norm: {norm:.4f}, lr: {lr:.2e}, throughput: {throughput:.1f} tokens/s')
+        
+        if ddp:
+            destroy_process_group()
 
     if args.test:
-        device = args.device
         model = GPT.from_pretrained(args.model_type)
-        model.to(device)
+        model.to(args.device)
         model.eval()
 
         import tiktoken
         tokenizer = tiktoken.get_encoding("gpt2")
 
-        test_model(model, tokenizer, device)
+        test_model(model, tokenizer)
        
